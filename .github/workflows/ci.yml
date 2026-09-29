@@ -118,9 +118,12 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Install Trivy
+        # Download then execute (no curl|sh pipe) so the install itself is auditable.
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.74.0
+          curl -sfL -o /tmp/install-trivy.sh \
+            https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh
+          sh /tmp/install-trivy.sh -b /usr/local/bin v0.74.0
+          trivy --version
 
       # DevSecOps gate: block on HIGH/CRITICAL. If this fails, downstream
       # push + deploy never run -> "block deployment on high-severity vulns".
