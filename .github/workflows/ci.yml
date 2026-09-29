@@ -1,0 +1,202 @@
+name: CI/CD
+
+# Git workflow: GitHub Flow (trunk-based).
+#   feature branch -> Pull Request -> checks run (test, SAST, build, image scan)
+#   -> squash-merge to main -> this pipeline versions, pushes the image, and
+#   deploys via GitOps. Version bump defaults to PATCH; include "#minor" or
+#   "#major" in the merge/commit message to bump those instead.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }} # ghcr.io/<owner>/sample-nodejs
+
+permissions:
+  contents: write        # create/push version tags
+  packages: write        # push image to GHCR
+  security-events: write # upload SARIF to the Security tab (bonus)
+
+jobs:
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit / smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.90.0
+    steps:
+      - uses: actions/checkout@v4
+      # Curated rulesets. --error => non-zero exit (pipeline FAILS) on findings
+      # at the selected severity, satisfying "fail on critical vulnerabilities".
+      - name: Semgrep scan (gate)
+        run: |
+          semgrep scan \
+            --config p/security-audit \
+            --config p/nodejs \
+            --config p/owasp-top-ten \
+            --severity ERROR \
+            --error \
+            --sarif --output semgrep.sarif .
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: semgrep.sarif
+
+  # ---------------------------------------------------------------------------
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      short_sha: ${{ steps.bump.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full tag history to compute the next version
+      - id: bump
+        name: Compute next semver
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          latest=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          latest=${latest:-v0.0.0}
+          IFS=. read -r major minor patch <<< "${latest#v}"
+          msg=$(git log -1 --pretty=%B)
+          if echo "$msg" | grep -qiE '#major|BREAKING CHANGE'; then
+            major=$((major+1)); minor=0; patch=0
+          elif echo "$msg" | grep -qiE '#minor|^feat'; then
+            minor=$((minor+1)); patch=0
+          else
+            patch=$((patch+1))
+          fi
+          version="v${major}.${minor}.${patch}"
+          echo "Previous: ${latest}  ->  Next: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  build-scan-push:
+    name: Build, scan & push image
+    runs-on: ubuntu-latest
+    needs: [test, sast, version]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Build amd64 locally (loaded into the runner's docker) so Trivy can scan
+      # the exact artifact BEFORE anything is published or deployed.
+      - name: Build image (for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: local/scan:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # DevSecOps gate: block on HIGH/CRITICAL. If this fails, downstream
+      # push + deploy never run -> "block deployment on high-severity vulns".
+      - name: Trivy image scan (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: local/scan:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Trivy SARIF (Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: local/scan:${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+
+      # Only publish + tag on a real merge to main (not on PRs).
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push multi-arch (amd64 + arm64)
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.version.outputs.short_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Tag release in git
+        if: github.event_name == 'push'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ needs.version.outputs.version }}
+          git push origin ${{ needs.version.outputs.version }}
+
+  # ---------------------------------------------------------------------------
+  # GitOps deploy: bump the image tag in the separate GitOps repo. ArgoCD
+  # watches that repo and reconciles the change into the cluster.
+  deploy-gitops:
+    name: Bump GitOps repo (ArgoCD deploy)
+    runs-on: ubuntu-latest
+    needs: [build-scan-push, version]
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/sample-nodejs-gitops
+          ssh-key: ${{ secrets.GITOPS_SSH_KEY }}
+      - name: Bump image tag in Helm values
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          sed -i -E "s|(^\s*tag:\s*).*|\1\"${VERSION}\"|" charts/sample-nodejs/values.yaml
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add charts/sample-nodejs/values.yaml
+          git commit -m "chore(deploy): sample-nodejs ${VERSION} [skip ci]" || echo "no change"
+          git push
