@@ -117,27 +117,23 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.74.0
+
       # DevSecOps gate: block on HIGH/CRITICAL. If this fails, downstream
       # push + deploy never run -> "block deployment on high-severity vulns".
       - name: Trivy image scan (gate)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: local/scan:${{ github.sha }}
-          format: table
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: HIGH,CRITICAL
+        run: |
+          trivy image --scanners vuln --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 1 local/scan:${{ github.sha }}
 
       - name: Trivy SARIF (Security tab)
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
-        continue-on-error: true
-        with:
-          image-ref: local/scan:${{ github.sha }}
-          format: sarif
-          output: trivy.sarif
-          severity: HIGH,CRITICAL
+        run: |
+          trivy image --scanners vuln --severity HIGH,CRITICAL \
+            --format sarif --output trivy.sarif local/scan:${{ github.sha }} || true
       - name: Upload Trivy SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
